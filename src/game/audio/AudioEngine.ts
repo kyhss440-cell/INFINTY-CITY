@@ -80,14 +80,16 @@ export class AudioEngine {
       return;
     }
     const baseFreq =
-      category === 'bus' || category === 'truck'
+      category === 'airplane'
+        ? 68
+        : category === 'bus' || category === 'truck'
         ? 38
         : category === 'auto'
         ? 64
         : category === 'motorcycle'
         ? 72
         : 48;
-    const freq = baseFreq + Math.abs(speedKmh) * 0.85;
+    const freq = baseFreq + Math.abs(speedKmh) * (category === 'airplane' ? 0.55 : 0.85);
     this.engineOsc.frequency.setTargetAtTime(freq, this.ctx.currentTime, 0.06);
     const vol = Math.min(0.055, 0.018 + Math.abs(speedKmh) * 0.0003);
     this.engineGain.gain.setTargetAtTime(vol, this.ctx.currentTime, 0.08);
@@ -108,7 +110,12 @@ export class AudioEngine {
     const osc2 = this.ctx.createOscillator();
     const gain = this.ctx.createGain();
 
-    if (category === 'bus' || category === 'truck') {
+    if (category === 'airplane') {
+      osc1.type = 'sine';
+      osc2.type = 'triangle';
+      osc1.frequency.value = 520;
+      osc2.frequency.value = 659;
+    } else if (category === 'bus' || category === 'truck') {
       osc1.type = 'sawtooth';
       osc2.type = 'sawtooth';
       osc1.frequency.value = 185;

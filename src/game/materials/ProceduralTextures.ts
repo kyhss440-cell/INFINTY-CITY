@@ -216,9 +216,11 @@ export function createHumanSkinTexture(
   eyeHex: string,
   facialHair: 'none' | 'mustache' | 'stubble' | 'fullBeard',
   gender: 'male' | 'female',
-  ageGroup: 'child' | 'teen' | 'adult' | 'senior'
+  ageGroup: 'child' | 'teen' | 'adult' | 'senior',
+  faceVariant = 0
 ): THREE.CanvasTexture {
-  const key = `face_${skinHex}_${eyeHex}_${facialHair}_${gender}_${ageGroup}`;
+  const variant = Math.abs(faceVariant) % 8;
+  const key = `face_${skinHex}_${eyeHex}_${facialHair}_${gender}_${ageGroup}_v${variant}`;
   if (textureCache.has(key)) return textureCache.get(key)!;
 
   const canvas = document.createElement('canvas');
@@ -230,73 +232,95 @@ export function createHumanSkinTexture(
   ctx.fillStyle = skinHex;
   ctx.fillRect(0, 0, 256, 256);
 
+  // Subtle forehead & temple lighting contour
+  const foreheadGlow = ctx.createRadialGradient(128, 72, 6, 128, 72, 64);
+  foreheadGlow.addColorStop(0, 'rgba(255, 232, 210, 0.14)');
+  foreheadGlow.addColorStop(1, 'rgba(255, 232, 210, 0)');
+  ctx.fillStyle = foreheadGlow;
+  ctx.fillRect(48, 16, 160, 110);
+
   // Subtle cheek/nose warmth gradient (organic subsurface feel)
-  const cheekGrad = ctx.createRadialGradient(90, 148, 4, 90, 148, 36);
-  cheekGrad.addColorStop(0, 'rgba(195, 78, 65, 0.22)');
+  const cheekAlpha = gender === 'female' ? 0.25 : 0.18;
+  const cheekGrad = ctx.createRadialGradient(88, 146, 4, 88, 146, 36);
+  cheekGrad.addColorStop(0, `rgba(195, 78, 65, ${cheekAlpha})`);
   cheekGrad.addColorStop(1, 'rgba(195, 78, 65, 0)');
   ctx.fillStyle = cheekGrad;
   ctx.fillRect(45, 110, 90, 80);
 
-  const cheekGradR = ctx.createRadialGradient(166, 148, 4, 166, 148, 36);
-  cheekGradR.addColorStop(0, 'rgba(195, 78, 65, 0.22)');
+  const cheekGradR = ctx.createRadialGradient(168, 146, 4, 168, 146, 36);
+  cheekGradR.addColorStop(0, `rgba(195, 78, 65, ${cheekAlpha})`);
   cheekGradR.addColorStop(1, 'rgba(195, 78, 65, 0)');
   ctx.fillStyle = cheekGradR;
   ctx.fillRect(120, 110, 90, 80);
 
-  // Subtle skin micro-pores / tone variation
-  for (let i = 0; i < 400; i++) {
-    ctx.fillStyle = i % 2 === 0 ? 'rgba(0,0,0,0.03)' : 'rgba(255,255,255,0.025)';
-    ctx.fillRect(Math.random() * 256, Math.random() * 256, 2, 2);
+  // Deterministic skin micro-pores / tone variation
+  for (let i = 0; i < 420; i++) {
+    const px = ((i * 73 + variant * 29) % 256);
+    const py = ((i * 137 + variant * 53) % 256);
+    ctx.fillStyle = i % 2 === 0 ? 'rgba(0,0,0,0.028)' : 'rgba(255,255,255,0.022)';
+    ctx.fillRect(px, py, 2, 2);
   }
 
-  // Under-eye / brow shading
+  // Under-eye / socket depth shading
   ctx.fillStyle = 'rgba(40, 20, 15, 0.14)';
   ctx.beginPath();
   ctx.ellipse(92, 108, 22, 10, 0, 0, Math.PI * 2);
   ctx.ellipse(164, 108, 22, 10, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // Eyebrows
-  ctx.strokeStyle = ageGroup === 'senior' ? '#9ca3af' : '#181412';
-  ctx.lineWidth = gender === 'male' ? 6 : 4;
-  ctx.lineCap = 'round';
+  // Traditional subtle bindi/pottu on select female adult/senior variants
+  if (gender === 'female' && ageGroup !== 'child' && (variant % 3 === 0)) {
+    ctx.fillStyle = variant === 0 ? '#991b1b' : '#18181b';
+    ctx.beginPath();
+    ctx.arc(128, 86, 3.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Subtle nose bridge & nostril contour
+  ctx.fillStyle = 'rgba(255, 235, 215, 0.12)';
+  ctx.fillRect(125, 104, 6, 32);
+  ctx.fillStyle = 'rgba(45, 22, 12, 0.18)';
   ctx.beginPath();
-  ctx.moveTo(72, 95);
-  ctx.quadraticCurveTo(94, 87, 112, 94);
-  ctx.moveTo(144, 94);
-  ctx.quadraticCurveTo(162, 87, 184, 95);
-  ctx.stroke();
+  ctx.arc(121, 144, 3.5, 0, Math.PI * 2);
+  ctx.arc(135, 144, 3.5, 0, Math.PI * 2);
+  ctx.fill();
 
-  // Nose bridge shadow
-  ctx.fillStyle = 'rgba(45, 22, 12, 0.16)';
-  ctx.fillRect(123, 108, 10, 34);
+  // Varied cheek/chin beauty mark or dimple shading per variant
+  if (variant === 2 || variant === 5) {
+    ctx.fillStyle = 'rgba(45, 25, 15, 0.55)';
+    ctx.beginPath();
+    ctx.arc(variant === 2 ? 156 : 96, 154, 1.8, 0, Math.PI * 2);
+    ctx.fill();
+  }
 
-  // Lips
+  // Lips with variant fullness
+  const lipWidth = 15 + (variant % 4) * 1.4;
+  const lipHeight = (gender === 'female' ? 6.5 : 5.2) + (variant % 3) * 0.7;
   ctx.fillStyle = gender === 'female' ? '#9f3e48' : '#7c3f38';
   ctx.beginPath();
-  ctx.ellipse(128, 174, 18, 6, 0, 0, Math.PI * 2);
+  ctx.ellipse(128, 174, lipWidth, lipHeight, 0, 0, Math.PI * 2);
   ctx.fill();
-  ctx.strokeStyle = 'rgba(30, 10, 10, 0.45)';
-  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = 'rgba(30, 10, 10, 0.42)';
+  ctx.lineWidth = 1.4;
   ctx.beginPath();
-  ctx.moveTo(111, 174);
-  ctx.lineTo(145, 174);
+  ctx.moveTo(128 - lipWidth + 1, 174);
+  ctx.lineTo(128 + lipWidth - 1, 174);
   ctx.stroke();
 
   // Facial hair details
   if (facialHair === 'stubble') {
     ctx.fillStyle = 'rgba(20, 18, 18, 0.18)';
-    for (let i = 0; i < 450; i++) {
-      const x = 86 + Math.random() * 84;
-      const y = 162 + Math.random() * 52;
+    for (let i = 0; i < 420; i++) {
+      const x = 86 + ((i * 47 + variant * 17) % 84);
+      const y = 162 + ((i * 31 + variant * 11) % 52);
       ctx.fillRect(x, y, 1.5, 1.5);
     }
   } else if (facialHair === 'mustache') {
     ctx.fillStyle = ageGroup === 'senior' ? '#9ca3af' : '#1b1715';
     ctx.beginPath();
-    ctx.moveTo(106, 164);
-    ctx.quadraticCurveTo(128, 155, 150, 164);
-    ctx.quadraticCurveTo(128, 168, 106, 164);
+    ctx.moveTo(104, 165);
+    ctx.quadraticCurveTo(128, 154, 152, 165);
+    ctx.quadraticCurveTo(128, 169, 104, 165);
     ctx.fill();
   } else if (facialHair === 'fullBeard') {
     ctx.fillStyle = ageGroup === 'senior' ? '#9ca3af' : '#1b1715';
@@ -318,6 +342,10 @@ export function createHumanSkinTexture(
     ctx.lineTo(164, 62);
     ctx.moveTo(96, 70);
     ctx.lineTo(160, 70);
+    ctx.moveTo(100, 158);
+    ctx.quadraticCurveTo(96, 174, 104, 186);
+    ctx.moveTo(156, 158);
+    ctx.quadraticCurveTo(160, 174, 152, 186);
     ctx.stroke();
   }
 

@@ -59,7 +59,7 @@ export interface HumanAppearance {
   secondaryColor: string;
   accentColor: string;
   heightScale: number;
-  buildScale: number; // width/muscle/torso thickness
+  buildScale: number;
   glasses: boolean;
   sunglasses: boolean;
   prop: 'none' | 'phone' | 'teaGlass' | 'bag' | 'stethoscope' | 'ticketMachine' | 'camera' | 'umbrella';
@@ -75,7 +75,8 @@ export type VehicleCategory =
   | 'truck'
   | 'police'
   | 'ambulance'
-  | 'boat';
+  | 'boat'
+  | 'airplane';
 
 export interface VehicleSpec {
   id: string;
@@ -93,6 +94,7 @@ export interface VehicleSpec {
   price: number;
   seats: number;
   isWatercraft?: boolean;
+  isAircraft?: boolean;
   isEmergency?: boolean;
   destinationBoard?: string;
 }
@@ -103,6 +105,9 @@ export interface OwnedVehicle extends VehicleSpec {
   engineLevel: number;
   handlingLevel: number;
   health: number; // 0-100
+  fuel: number; // 0-100
+  parkedX: number;
+  parkedZ: number;
 }
 
 export interface KeralaDistrict {
@@ -121,30 +126,42 @@ export interface KeralaDistrict {
   unlocked: boolean;
 }
 
+export type WorldLocationType =
+  | 'home'
+  | 'mansion'
+  | 'hospital'
+  | 'police'
+  | 'firestation'
+  | 'bank'
+  | 'govt'
+  | 'railway'
+  | 'busstand'
+  | 'airport'
+  | 'jetty'
+  | 'shop'
+  | 'mall'
+  | 'clothing'
+  | 'electronics'
+  | 'restaurant'
+  | 'hotel'
+  | 'cinema'
+  | 'school'
+  | 'fuel'
+  | 'garage'
+  | 'landmark';
+
 export interface WorldLocation {
   id: string;
   name: string;
   malayalamName: string;
-  type:
-    | 'home'
-    | 'mansion'
-    | 'hospital'
-    | 'police'
-    | 'govt'
-    | 'railway'
-    | 'busstand'
-    | 'airport'
-    | 'jetty'
-    | 'shop'
-    | 'restaurant'
-    | 'garage'
-    | 'landmark';
+  type: WorldLocationType;
   x: number;
   z: number;
   radius: number;
   districtId: string;
   description: string;
   interactPrompt?: string;
+  enterable?: boolean;
 }
 
 export interface PropertyListing {
@@ -153,6 +170,7 @@ export interface PropertyListing {
   malayalamName: string;
   type: 'House' | 'Apartment' | 'Villa' | 'Luxury Mansion';
   district: string;
+  districtId: string;
   price: number;
   owned: boolean;
   garageSlots: number;
@@ -162,14 +180,42 @@ export interface PropertyListing {
   features: string[];
 }
 
+export interface HouseUpgradeDef {
+  id: string;
+  name: string;
+  category: 'Furniture' | 'Exterior' | 'Security' | 'Garage';
+  price: number;
+  description: string;
+}
+
+export interface StoreItemDef {
+  id: string;
+  name: string;
+  malayalamName: string;
+  category: 'food' | 'clothing' | 'electronics' | 'gear' | 'vehicle';
+  shopTypes: WorldLocationType[];
+  price: number;
+  healthGain?: number;
+  description: string;
+}
+
+export interface InventoryItem {
+  itemId: string;
+  name: string;
+  category: StoreItemDef['category'];
+  quantity: number;
+  healthGain?: number;
+}
+
 export interface MissionDef {
   id: string;
   title: string;
   malayalamTitle: string;
-  category: 'Taxi' | 'Bus' | 'Ambulance' | 'Delivery' | 'Racing' | 'Story' | 'Boat';
+  category: 'Taxi' | 'Bus' | 'Ambulance' | 'Delivery' | 'Racing' | 'Story' | 'Boat' | 'Rival';
   giverName: string;
   description: string;
   rewardCash: number;
+  rewardPoints: number;
   targetX: number;
   targetZ: number;
   targetLabel: string;
@@ -193,6 +239,34 @@ export interface TrafficFine {
   paid: boolean;
 }
 
+export interface TransitTicket {
+  id: string;
+  mode: 'train' | 'flight' | 'boat' | 'bus';
+  fromLabel: string;
+  toLabel: string;
+  destX: number;
+  destZ: number;
+  price: number;
+  issuedAt: number;
+  used: boolean;
+}
+
+export type GpsTravelMode = 'car' | 'bike' | 'walk' | 'boat';
+
+export interface GpsRouteState {
+  destinationId: string;
+  destinationName: string;
+  destX: number;
+  destZ: number;
+  mode: GpsTravelMode;
+  useAlternative: boolean;
+  waypoints: Array<{ x: number; z: number; label?: string }>;
+  altWaypoints: Array<{ x: number; z: number; label?: string }>;
+  distanceMeters: number;
+  etaSeconds: number;
+  nextTurnHint: string;
+}
+
 export interface NpcDialogueSession {
   npcId: string;
   name: string;
@@ -200,7 +274,22 @@ export interface NpcDialogueSession {
   role: string;
   greetingEn: string;
   greetingMl: string;
-  serviceType: 'general' | 'teaShop' | 'hospital' | 'police' | 'railway' | 'bus' | 'airport' | 'boat' | 'showroom' | 'property' | 'govt';
+  serviceType:
+    | 'general'
+    | 'teaShop'
+    | 'hospital'
+    | 'police'
+    | 'railway'
+    | 'bus'
+    | 'airport'
+    | 'boat'
+    | 'showroom'
+    | 'property'
+    | 'govt'
+    | 'mall'
+    | 'fuel'
+    | 'bank'
+    | 'cinema';
   nearbyMissionId?: string;
 }
 
@@ -214,6 +303,15 @@ export interface GameNotification {
 export interface MinimapEntity {
   x: number;
   z: number;
-  type: 'npc' | 'vehicle' | 'police' | 'location' | 'mission';
+  type:
+    | 'npc'
+    | 'vehicle'
+    | 'police'
+    | 'location'
+    | 'mission'
+    | 'my_house'
+    | 'my_garage'
+    | 'my_car'
+    | 'my_bike';
   label?: string;
 }

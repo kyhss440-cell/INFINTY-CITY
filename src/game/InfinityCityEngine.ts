@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { WORLD_LOCATIONS } from '../data/keralaWorldData';
+import { VEHICLE_CATALOG, PROPERTY_CATALOG, WORLD_LOCATIONS } from '../data/keralaWorldData';
 import { useGameStore } from '../store/gameStore';
 import { HumanAppearance, MinimapEntity } from '../types/game';
 import { AudioEngine } from './audio/AudioEngine';
@@ -12,8 +12,9 @@ import {
 import { buildHumanRig, HumanRig } from './humans/HumanRigBuilder';
 import { NpcManager } from './humans/NpcManager';
 import { createWeatherAndTimeSystem, WeatherAndTimeHandle } from './systems/WeatherAndTimeSystem';
+import { buildVehicleModel, BuiltVehicleModel } from './vehicles/VehicleBuilder';
 import { DrivingInput, SimVehicle, VehicleSimulation } from './vehicles/VehicleSimulation';
-import { AABBCollider, buildKeralaWorld, KeralaWorldHandles } from './world/KeralaWorldBuilder';
+import { AABBCollider, buildKeralaWorld, isWaterAt, KeralaWorldHandles } from './world/KeralaWorldBuilder';
 
 export interface MobileInputState {
   moveX: number; // -1..1
@@ -22,11 +23,11 @@ export interface MobileInputState {
   lookDeltaY: number;
   handbrake: boolean;
   sprint: boolean;
+  climb: number; // -1..1 for aircraft
 }
 
 const _camTarget = new THREE.Vector3();
 const _camDesired = new THREE.Vector3();
-const _playerVec = new THREE.Vector3();
 const _seatWorld = new THREE.Vector3();
 
 export class InfinityCityEngine {
@@ -54,7 +55,11 @@ export class InfinityCityEngine {
 
   private activeVehicle: SimVehicle | null = null;
   private isRidingTrain = false;
+  private parachuteActive = false;
+  private leftIndicator = false;
+  private rightIndicator = false;
   private punchTimer = 0;
+  private stunCooldown = 0;
   private cameraShake = 0;
   private cameraYaw = 0;
   private cameraPitch = 0.28;
@@ -70,9 +75,28 @@ export class InfinityCityEngine {
     lookDeltaY: 0,
     handbrake: false,
     sprint: false,
+    climb: 0,
   };
 
   private missionBeacon: THREE.Group;
+  private gpsRouteLine: THREE.Line;
+  private gpsDestMarker: THREE.Mesh;
+  private lastGpsSignature = '';
+
+  private stunBoltMesh: THREE.Mesh;
+  private stunBoltState = { active: false, vx: 0, vz: 0, life: 0 };
+
+  private flightAirliner: BuiltVehicleModel | null = null;
+  private flightSequence: {
+    active: boolean;
+    startX: number;
+    startZ: number;
+    destX: number;
+    destZ: number;
+    destName: string;
+    progress: number;
+  } | null = null;
+
   private impactParticles: Array<{
     mesh: THREE.Mesh;
     vx: number;
@@ -81,15 +105,17 @@ export class InfinityCityEngine {
     life: number;
   }> = [];
   private telemetryTimer = 0;
+  private gpsRefreshTimer = 0;
   private lastTeleportNonce = 0;
   private lastSpawnVehicleNonce = 0;
   private lastExitNonce = 0;
+  private lastFlightNonce = 0;
+  private lastRefuelNonce = 0;
   private lastAppearanceSignature = '';
 
   constructor(container: HTMLElement) {
     this.container = container;
 
-    // 1. Detect software WebGL cleanly from GPU renderer string
     this.isSoftwareGl = (() => {
       try {
         const probe = document.createElement('canvas');
@@ -105,7 +131,6 @@ export class InfinityCityEngine {
       }
     })();
 
-    // 2. Modern Three.js WebGLRenderer
     this.renderer = new THREE.WebGLRenderer({
       antialias: !this.isSoftwareGl,
       powerPreference: 'high-performance',
@@ -119,29 +144,25 @@ export class InfinityCityEngine {
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.appendChild(this.renderer.domElement);
 
-    // 3. Scene & Camera
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(
       65,
       (container.clientWidth || window.innerWidth) / (container.clientHeight || window.innerHeight),
       0.15,
-      620
+      720
     );
 
-    // 4. Studio Environment Reflections (PMREM RoomEnvironment)
     const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
     this.scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
     pmremGenerator.dispose();
 
     const maxAnisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
 
-    // 5. Build World, Weather, Vehicles & Kerala Human Population
     this.weatherTime = createWeatherAndTimeSystem(this.scene, this.isSoftwareGl);
     this.world = buildKeralaWorld(this.scene, maxAnisotropy);
     this.npcManager = new NpcManager(this.scene);
     this.vehicleSim = new VehicleSimulation(this.scene);
 
-    // 6. Build Main Player Character
     const initialAppearance = useGameStore.getState().playerAppearance;
     this.lastAppearanceSignature = this.appearanceKey(initialAppearance);
     this.playerRig = buildHumanRig(initialAppearance);
@@ -149,7 +170,7 @@ export class InfinityCityEngine {
     this.scene.add(this.playerRig.root);
     this.playerAnim = createHumanAnimController(1);
 
-    // 7. 3D Mission Target Beacon
+    // 3D Mission Target Beacon
     this.missionBeacon = new THREE.Group();
     const beam = new THREE.Mesh(
       new THREE.CylinderGeometry(0.45, 0.45, 28, 12, 1, true),
@@ -172,7 +193,36 @@ export class InfinityCityEngine {
     this.missionBeacon.visible = false;
     this.scene.add(this.missionBeacon);
 
-    // 8. Pooled Impact Burst Particles (stylized dust & spark burst on impacts)
+    // 3D GPS Navigation Line & Destination Pin
+    const gpsGeo = new THREE.BufferGeometry();
+    const gpsMat = new THREE.LineBasicMaterial({ color: '#06b6d4', transparent: true, opacity: 0.9 });
+    this.gpsRouteLine = new THREE.Line(gpsGeo, gpsMat);
+    this.gpsRouteLine.visible = false;
+    this.scene.add(this.gpsRouteLine);
+
+    this.gpsDestMarker = new THREE.Mesh(
+      new THREE.RingGeometry(2.0, 2.8, 24),
+      new THREE.MeshBasicMaterial({ color: '#06b6d4', side: THREE.DoubleSide, transparent: true, opacity: 0.85 })
+    );
+    this.gpsDestMarker.rotation.x = -Math.PI / 2;
+    this.gpsDestMarker.visible = false;
+    this.scene.add(this.gpsDestMarker);
+
+    // Arcade Pulse Stunner Bolt (non-lethal glowing cyan sphere)
+    this.stunBoltMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(0.24, 10, 10),
+      new THREE.MeshBasicMaterial({ color: '#22d3ee' })
+    );
+    this.stunBoltMesh.visible = false;
+    this.scene.add(this.stunBoltMesh);
+
+    const jetSpec = VEHICLE_CATALOG.find((v) => v.id === 'kerala_air_jet');
+    if (jetSpec) {
+      this.flightAirliner = buildVehicleModel(jetSpec);
+      this.flightAirliner.group.visible = false;
+      this.scene.add(this.flightAirliner.group);
+    }
+
     const puffGeo = new THREE.SphereGeometry(0.18, 6, 6);
     const puffMatLight = new THREE.MeshBasicMaterial({ color: '#fde68a', transparent: true, opacity: 0.85 });
     const puffMatDust = new THREE.MeshBasicMaterial({ color: '#e2e8f0', transparent: true, opacity: 0.75 });
@@ -183,7 +233,6 @@ export class InfinityCityEngine {
       this.impactParticles.push({ mesh, vx: 0, vy: 0, vz: 0, life: 0 });
     }
 
-    // Pre-warm shaders on hardware GPUs
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
     }
@@ -312,6 +361,11 @@ export class InfinityCityEngine {
       return;
     }
 
+    if (e.code === 'KeyI' && store.phase === 'playing') {
+      store.setActiveModal(store.activeModal === 'inventory' ? 'none' : 'inventory');
+      return;
+    }
+
     if (store.phase !== 'playing' || store.activeModal !== 'none') return;
 
     if (e.code === 'KeyE') {
@@ -320,6 +374,20 @@ export class InfinityCityEngine {
       this.triggerInteraction();
     } else if (e.code === 'KeyJ') {
       this.triggerMeleePunch();
+    } else if (e.code === 'KeyK') {
+      this.triggerPulseStunner();
+    } else if (e.code === 'KeyQ') {
+      if (this.activeVehicle) {
+        this.leftIndicator = !this.leftIndicator;
+        if (this.leftIndicator) this.rightIndicator = false;
+        this.audio.playChime('click');
+      }
+    } else if (e.code === 'KeyZ') {
+      if (this.activeVehicle) {
+        this.rightIndicator = !this.rightIndicator;
+        if (this.rightIndicator) this.leftIndicator = false;
+        this.audio.playChime('click');
+      }
     } else if (e.code === 'KeyC') {
       store.cycleCameraMode();
     } else if (e.code === 'KeyM') {
@@ -350,16 +418,54 @@ export class InfinityCityEngine {
       this.spawnImpactBurst(hitNpc.x, 1.1, hitNpc.z, 0.9);
       this.audio.playImpact(0.95);
       this.cameraShake = Math.max(this.cameraShake, 0.24);
-      store.escalateWanted('Street Altercation', 1);
+      if (hitNpc.def.appearance.id === 'npc_kollam_rival') {
+        store.awardPoints(2, 'Neutralized Harbour Rival');
+      } else {
+        store.escalateWanted('Street Altercation', 1);
+      }
     } else {
       this.audio.playImpact(0.32);
+    }
+  }
+
+  public triggerPulseStunner(): void {
+    const store = useGameStore.getState();
+    if (this.activeVehicle || this.isRidingTrain || store.phase !== 'playing' || store.activeModal !== 'none') {
+      return;
+    }
+    if (!store.hasInventoryItem('item_stun_blaster')) {
+      store.pushNotification(
+        'Arcade Pulse Stunner Required',
+        'Buy the non-lethal Arcade Pulse Stunner at Malabar Grand Mall or Electronics Shop.',
+        'info'
+      );
+      return;
+    }
+    if (this.stunCooldown > 0) return;
+    this.stunCooldown = 0.65;
+
+    const dirX = Math.sin(this.playerYaw);
+    const dirZ = Math.cos(this.playerYaw);
+    this.stunBoltMesh.position.set(this.playerPos.x + dirX * 0.9, 1.25, this.playerPos.z + dirZ * 0.9);
+    this.stunBoltMesh.visible = true;
+    this.stunBoltState = { active: true, vx: dirX * 28, vz: dirZ * 28, life: 0.5 };
+    this.audio.playChime('click');
+
+    const stunned = this.npcManager.stunNearbyNpcInCone(this.playerPos.x, this.playerPos.z, dirX, dirZ, 16);
+    if (stunned) {
+      this.spawnImpactBurst(stunned.x, 1.1, stunned.z, 1.1);
+      this.audio.playImpact(0.8);
+      if (stunned.def.appearance.id === 'npc_kollam_rival') {
+        store.awardPoints(2, 'Stunned Harbour Rival');
+      } else {
+        store.escalateWanted('Public Pulse Stunner Discharge', 1);
+      }
     }
   }
 
   public triggerEnterExitVehicle(): void {
     const store = useGameStore.getState();
 
-    // Exit moving/stopped Kerala Express Train
     if (this.isRidingTrain) {
       const ts = this.world.trainState;
       this.isRidingTrain = false;
@@ -373,34 +479,67 @@ export class InfinityCityEngine {
     }
 
     if (this.activeVehicle) {
-      // Exit vehicle cleanly onto left/right door side
-      const exitSide = this.activeVehicle.spec.isWatercraft ? 0 : -2.2;
-      const cosY = Math.cos(this.activeVehicle.yaw);
-      const sinY = Math.sin(this.activeVehicle.yaw);
-      const ex = this.activeVehicle.x + cosY * exitSide;
-      const ez = this.activeVehicle.z - sinY * exitSide;
+      const v = this.activeVehicle;
+      const exitSide = v.spec.isWatercraft ? 0 : v.spec.isAircraft ? -3.4 : -2.2;
+      const cosY = Math.cos(v.yaw);
+      const sinY = Math.sin(v.yaw);
+      const ex = v.x + cosY * exitSide;
+      const ez = v.z - sinY * exitSide;
 
-      // If exiting boat, place on jetty/shore if near water edge
-      const safeX = this.activeVehicle.spec.isWatercraft ? Math.max(-188, ex) : ex;
+      const safeX = v.spec.isWatercraft ? Math.max(-188, ex) : ex;
+      const exitAlt = v.spec.isAircraft && v.y > 3.5 ? v.y : 0;
+      v.isPlayerDriven = false;
+      v.speed *= 0.25;
+      this.leftIndicator = false;
+      this.rightIndicator = false;
 
-      this.activeVehicle.isPlayerDriven = false;
-      this.activeVehicle.speed *= 0.25;
+      // Persist parked location & fuel/health on owned vehicles for GPS map markers!
+      store.updateOwnedVehicleParkedPos(v.spec.id, v.x, v.z, v.fuel, v.health);
+
       this.activeVehicle = null;
-
-      this.playerPos.set(safeX, 0, ez);
+      this.playerPos.set(safeX, exitAlt, ez);
+      if (exitAlt > 0) {
+        this.isGrounded = false;
+        this.playerVelY = 0;
+        this.parachuteActive = true;
+        store.pushNotification('Parachute Glider Deployed', 'Gliding safely down to Kerala terrain!', 'info');
+      }
       this.playerRig.root.visible = true;
       this.playerRig.root.position.copy(this.playerPos);
       this.audio.playChime('click');
-      store.updateTelemetry({ inVehicle: false, speedKmh: 0, gearLabel: 'N' });
+      store.updateTelemetry({
+        inVehicle: false,
+        inAircraft: false,
+        altitudeMeters: 0,
+        speedKmh: 0,
+        gearLabel: 'N',
+        leftIndicator: false,
+        rightIndicator: false,
+      });
       return;
     }
 
-    // Check if near Kerala Express Coach 1 to board!
+    // Board Kerala Express Train (with Ticket check!)
     const ts = this.world.trainState;
     if (
       Math.abs(this.playerPos.x - ts.x) < 6.4 &&
       Math.abs(this.playerPos.z - (ts.z - 6)) < 11.5
     ) {
+      const trainTicket = store.hasValidTicketForMode('train');
+      if (trainTicket) {
+        store.consumeTransitTicket(trainTicket.id);
+        store.pushNotification(
+          'Train Ticket Verified',
+          'Enjoy your Kerala Express ride! Press E anytime to disembark.',
+          'success'
+        );
+      } else {
+        store.issueTrafficFine(
+          'Boarded Kerala Express without Ticket (TTE Inspection)',
+          'ടിക്കറ്റില്ലാതെ ട്രെയിൻ യാത്ര',
+          1000
+        );
+      }
       this.isRidingTrain = true;
       this.cameraYaw = Math.PI * 0.82;
       this.audio.playTrainHorn();
@@ -408,35 +547,68 @@ export class InfinityCityEngine {
         inTrain: true,
         currentLocationName: 'Kerala Express · Passenger Coach',
       });
-      store.pushNotification(
-        'Boarded Kerala Express',
-        'Riding between Ernakulam Junction & Thiruvananthapuram Central. Press E to exit.',
-        'success'
-      );
       return;
     }
 
     const nearbyVeh = this.vehicleSim.findClosestEnterableVehicle(this.playerPos, 4.8);
     if (nearbyVeh) {
+      // Check Boat Rental / Ownership if watercraft
+      if (nearbyVeh.spec.isWatercraft) {
+        const ownsBoat = store.ownedVehicles.some((ov) => ov.id === nearbyVeh.spec.id);
+        const hasRental = Date.now() < store.boatRentalUntil;
+        if (!ownsBoat && !hasRental) {
+          store.pushNotification(
+            'Boat Rental Tip',
+            'Visit Boat Jetty to rent a 5-min Water Pass or buy this boat in Garage.',
+            'info'
+          );
+        }
+      } else if (nearbyVeh.spec.isAircraft) {
+        store.pushNotification(
+          `Boarded ${nearbyVeh.spec.modelName}`,
+          'W/S Thrust · A/D Bank & Steer · SPACE Takeoff/Climb · SHIFT Descend · C Cockpit Cam',
+          'success'
+        );
+      }
+
       nearbyVeh.isAiTraffic = false;
       nearbyVeh.isPlayerDriven = true;
       this.activeVehicle = nearbyVeh;
+      this.parachuteActive = false;
       this.cameraYaw = nearbyVeh.yaw + Math.PI;
       this.audio.playChime('click');
       store.updateTelemetry({
         inVehicle: true,
+        inAircraft: !!nearbyVeh.spec.isAircraft,
+        altitudeMeters: nearbyVeh.spec.isAircraft ? Math.max(0, Math.round(nearbyVeh.y)) : 0,
         currentVehicleName: nearbyVeh.spec.modelName,
         currentVehiclePlate: nearbyVeh.spec.plateNumber,
         currentVehicleCategory: nearbyVeh.spec.category,
+        currentVehicleFuel: Math.round(nearbyVeh.fuel),
+        currentVehicleHealth: Math.round(nearbyVeh.health),
       });
     }
   }
 
   public triggerInteraction(): void {
-    if (this.activeVehicle || this.isRidingTrain) return;
     const store = useGameStore.getState();
 
-    // 1. Check nearby NPC
+    // Allow instant refueling at fuel station while sitting inside a vehicle!
+    if (this.activeVehicle) {
+      for (const loc of WORLD_LOCATIONS) {
+        if (loc.type === 'fuel' && Math.hypot(this.playerPos.x - loc.x, this.playerPos.z - loc.z) <= loc.radius + 4) {
+          if (store.refuelActiveVehicleAtPump(450)) {
+            this.activeVehicle.fuel = 100;
+            this.audio.playChime('success');
+          }
+          return;
+        }
+      }
+      return;
+    }
+
+    if (this.isRidingTrain) return;
+
     const npcSession = this.npcManager.findClosestInteractableNpc(this.playerPos, 4.2);
     if (npcSession) {
       this.audio.playChime('click');
@@ -444,7 +616,6 @@ export class InfinityCityEngine {
       return;
     }
 
-    // 2. Check nearby World Location portal
     for (const loc of WORLD_LOCATIONS) {
       const dist = Math.hypot(this.playerPos.x - loc.x, this.playerPos.z - loc.z);
       if (dist <= loc.radius) {
@@ -453,16 +624,27 @@ export class InfinityCityEngine {
           store.setActiveModal('garage');
         } else if (loc.type === 'home') {
           this.audio.playChime('success');
-          void store.saveHomeCheckpoint('prop_tharavadu');
+          void store.saveHomeCheckpoint('prop_tharavadu', true);
         } else if (loc.type === 'mansion') {
           if (store.ownedPropertyIds.includes('prop_pearl_mansion') && dist < 8.5) {
             this.audio.playChime('success');
-            void store.saveHomeCheckpoint('prop_pearl_mansion');
+            void store.saveHomeCheckpoint('prop_pearl_mansion', true);
           } else {
             store.setActiveModal('properties');
           }
-        } else if (loc.id === 'munnar_tea_estates') {
-          store.healPlayer(25, 40);
+        } else if (loc.type === 'mall' || loc.type === 'clothing' || loc.type === 'electronics' || loc.type === 'restaurant' || loc.type === 'hotel') {
+          store.openShopModal(loc.name, loc.malayalamName, loc.type);
+        } else if (loc.type === 'bank') {
+          store.openShopModal(loc.name, loc.malayalamName, 'bank');
+        } else if (loc.type === 'fuel') {
+          store.openShopModal(loc.name, loc.malayalamName, 'fuel');
+        } else if (loc.type === 'cinema') {
+          store.healPlayer(15, 250);
+          store.pushNotification('Padma Cineplex', 'Enjoyed a Malayalam film show! +15 Health & Stamina.', 'success');
+        } else if (loc.type === 'firestation') {
+          store.pushNotification('Ernakulam Fire & Rescue', 'Fire crews on standby across Ernakulam & NH-66.', 'info');
+        } else if (loc.type === 'school') {
+          store.awardPoints(1, `Visited ${loc.name}`);
         } else if (loc.type === 'shop') {
           store.openDialogue({
             npcId: 'portal_shop',
@@ -510,7 +692,7 @@ export class InfinityCityEngine {
             name: loc.name,
             malayalamName: loc.malayalamName,
             role: 'Air Terminal Check-In',
-            greetingEn: 'Check in for fast regional flights across Kerala airports.',
+            greetingEn: 'Check in for fast regional flights across Cochin, Kannur & Trivandrum airports.',
             greetingMl: 'വിമാന ടിക്കറ്റ് ചെക്ക്-ഇൻ കൗണ്ടർ.',
             serviceType: 'airport',
           });
@@ -519,9 +701,9 @@ export class InfinityCityEngine {
             npcId: 'portal_boat',
             name: loc.name,
             malayalamName: loc.malayalamName,
-            role: 'Water Metro Ferry Dock',
-            greetingEn: 'Board coastal & backwater ferries across Kerala waterways.',
-            greetingMl: 'വാട്ടർ മെട്രോ ബോട്ട് സർവീസ് കൗണ്ടർ.',
+            role: 'Water Metro & Boat Rental Dock',
+            greetingEn: 'Rent speedboats or board Water Metro ferries across Kerala waterways.',
+            greetingMl: 'വാട്ടർ മെട്രോ & ബോട്ട് വാടക കൗണ്ടർ.',
             serviceType: 'boat',
           });
         } else if (loc.type === 'busstand') {
@@ -540,21 +722,35 @@ export class InfinityCityEngine {
             npcId: 'portal_govt',
             name: loc.name,
             malayalamName: loc.malayalamName,
-            role: 'District Collectorate & RTO',
+            role: 'Government Secretariat & RTO',
             greetingEn: 'Public Administration & Vehicle Registration Center.',
-            greetingMl: 'ജില്ലാ കളക്ടറേറ്റ് & ആർ.ടി.ഒ.',
+            greetingMl: 'ഗവൺമെന്റ് ഓഫീസ് & ആർ.ടി.ഒ.',
             serviceType: 'govt',
             nearbyMissionId: 'mission_airport_vip',
           });
+        } else if (loc.type === 'landmark') {
+          store.markLocationDiscovered(loc.id, loc.name);
         }
         return;
       }
     }
   }
 
-  private resolvePlayerBuildingCollision(x: number, z: number, colliders: AABBCollider[]): { x: number; z: number } {
-    let rx = THREE.MathUtils.clamp(x, -365, 415);
-    let rz = THREE.MathUtils.clamp(z, -385, 395);
+  private resolvePlayerBuildingCollision(
+    oldX: number,
+    oldZ: number,
+    nextX: number,
+    nextZ: number,
+    colliders: AABBCollider[]
+  ): { x: number; z: number } {
+    let rx = THREE.MathUtils.clamp(nextX, -365, 415);
+    let rz = THREE.MathUtils.clamp(nextZ, -385, 395);
+
+    if (isWaterAt(rx, rz)) {
+      rx = oldX;
+      rz = oldZ;
+    }
+
     const radius = 0.55;
     for (let i = 0; i < colliders.length; i++) {
       const c = colliders[i];
@@ -590,8 +786,10 @@ export class InfinityCityEngine {
 
     if (store.pendingSpawnVehicle && store.pendingSpawnVehicle.nonce !== this.lastSpawnVehicleNonce) {
       this.lastSpawnVehicleNonce = store.pendingSpawnVehicle.nonce;
-      const sx = this.playerPos.x + Math.sin(this.playerYaw) * 5.5;
-      const sz = this.playerPos.z + Math.cos(this.playerYaw) * 5.5;
+      const spec = VEHICLE_CATALOG.find((v) => v.id === store.pendingSpawnVehicle?.specId);
+      const distAhead = spec?.isAircraft ? 10 : 5.5;
+      const sx = this.playerPos.x + Math.sin(this.playerYaw) * distAhead;
+      const sz = this.playerPos.z + Math.cos(this.playerYaw) * distAhead;
       this.vehicleSim.spawnCustomPlayerVehicle(
         store.pendingSpawnVehicle.specId,
         store.pendingSpawnVehicle.color,
@@ -604,6 +802,58 @@ export class InfinityCityEngine {
     if (store.pendingExitVehicleNonce !== this.lastExitNonce) {
       this.lastExitNonce = store.pendingExitVehicleNonce;
       if (this.activeVehicle) this.triggerEnterExitVehicle();
+    }
+
+    if (store.pendingRefuelActiveNonce !== this.lastRefuelNonce) {
+      this.lastRefuelNonce = store.pendingRefuelActiveNonce;
+      if (this.activeVehicle) {
+        this.activeVehicle.fuel = 100;
+        this.activeVehicle.health = 100;
+      }
+    }
+
+    if (store.pendingFlightTakeoff && store.pendingFlightTakeoff.nonce !== this.lastFlightNonce) {
+      this.lastFlightNonce = store.pendingFlightTakeoff.nonce;
+      if (this.activeVehicle) {
+        this.activeVehicle.isPlayerDriven = false;
+        this.activeVehicle = null;
+      }
+      this.isRidingTrain = false;
+      this.flightSequence = {
+        active: true,
+        startX: this.playerPos.x,
+        startZ: this.playerPos.z,
+        destX: store.pendingFlightTakeoff.destX,
+        destZ: store.pendingFlightTakeoff.destZ,
+        destName: store.pendingFlightTakeoff.destName,
+        progress: 0,
+      };
+      this.audio.playChime('success');
+      store.updateTelemetry({ inFlight: true, inVehicle: false, inTrain: false });
+    }
+  }
+
+  private update3dGpsRibbon(): void {
+    const route = useGameStore.getState().gpsRoute;
+    if (!route) {
+      if (this.gpsRouteLine.visible) {
+        this.gpsRouteLine.visible = false;
+        this.gpsDestMarker.visible = false;
+        this.lastGpsSignature = '';
+      }
+      return;
+    }
+
+    const pts = route.useAlternative ? route.altWaypoints : route.waypoints;
+    const sig = `${route.destinationId}_${route.useAlternative}_${pts.length}_${Math.round(pts[0]?.x ?? 0)}_${Math.round(pts[0]?.z ?? 0)}`;
+    if (sig !== this.lastGpsSignature) {
+      this.lastGpsSignature = sig;
+      const vecs = pts.map((p) => new THREE.Vector3(p.x, 0.35, p.z));
+      this.gpsRouteLine.geometry.dispose();
+      this.gpsRouteLine.geometry = new THREE.BufferGeometry().setFromPoints(vecs);
+      this.gpsRouteLine.visible = true;
+      this.gpsDestMarker.position.set(route.destX, 0.2, route.destZ);
+      this.gpsDestMarker.visible = true;
     }
   }
 
@@ -651,8 +901,8 @@ export class InfinityCityEngine {
     this.audio.setEnabled(store.audioEnabled);
     this.rebuildPlayerRigIfNeeded();
     this.handlePendingStoreCommands();
+    this.update3dGpsRibbon();
 
-    // Update look from mobile touch swipe if any
     if (this.mobileInput.lookDeltaX !== 0 || this.mobileInput.lookDeltaY !== 0) {
       this.cameraYaw -= this.mobileInput.lookDeltaX * 0.006;
       this.cameraPitch = THREE.MathUtils.clamp(
@@ -664,7 +914,6 @@ export class InfinityCityEngine {
       this.mobileInput.lookDeltaY = 0;
     }
 
-    // Weather, Time, World & Particle updates
     const envState = this.weatherTime.update(
       dt,
       elapsed,
@@ -676,10 +925,69 @@ export class InfinityCityEngine {
     this.world.updateDynamicWorld(dt, elapsed, envState.isNight, envState.wetness);
     this.updateImpactParticles(dt);
     this.punchTimer = Math.max(0, this.punchTimer - dt);
+    this.stunCooldown = Math.max(0, this.stunCooldown - dt);
     this.cameraShake = Math.max(0, this.cameraShake - dt * 2.8);
     this.audio.updateRain(store.phase === 'playing' ? envState.rainIntensity : 0);
 
-    // On Main Menu: gentle scenic orbit around Fort Kochi & Player
+    // Update Stun Bolt Projectile
+    if (this.stunBoltState.active) {
+      this.stunBoltState.life -= dt;
+      this.stunBoltMesh.position.x += this.stunBoltState.vx * dt;
+      this.stunBoltMesh.position.z += this.stunBoltState.vz * dt;
+      if (this.stunBoltState.life <= 0) {
+        this.stunBoltState.active = false;
+        this.stunBoltMesh.visible = false;
+      }
+    }
+
+    // Handle Airport Flight Cruise Cinematic inside 3D Kerala Airliner
+    if (this.flightSequence?.active) {
+      this.flightSequence.progress += dt / 4.2;
+      const t = Math.min(1, this.flightSequence.progress);
+      const px = THREE.MathUtils.lerp(this.flightSequence.startX, this.flightSequence.destX, t);
+      const pz = THREE.MathUtils.lerp(this.flightSequence.startZ, this.flightSequence.destZ + 12, t);
+      const alt = Math.sin(t * Math.PI) * 54;
+      const heading = Math.atan2(
+        this.flightSequence.destX - this.flightSequence.startX,
+        this.flightSequence.destZ + 12 - this.flightSequence.startZ
+      );
+
+      this.playerPos.set(px, alt, pz);
+      this.playerRig.root.visible = false;
+
+      if (this.flightAirliner) {
+        this.flightAirliner.group.visible = true;
+        this.flightAirliner.group.position.set(px, alt, pz);
+        this.flightAirliner.group.rotation.y = heading;
+        this.flightAirliner.group.rotation.x = Math.cos(t * Math.PI) * -0.18;
+        for (const fan of this.flightAirliner.propellers) {
+          fan.rotation.z += 24 * dt;
+        }
+      }
+
+      this.audio.updateEngine(true, 260, 'airplane');
+      this.camera.position.set(
+        px - Math.sin(heading) * 20 - Math.cos(heading) * 6,
+        alt + 7.5,
+        pz - Math.cos(heading) * 20 + Math.sin(heading) * 6
+      );
+      this.camera.lookAt(px + Math.sin(heading) * 8, alt + 1.5, pz + Math.cos(heading) * 8);
+
+      if (t >= 1) {
+        if (this.flightAirliner) this.flightAirliner.group.visible = false;
+        this.playerPos.set(this.flightSequence.destX, 0, this.flightSequence.destZ + 12);
+        this.playerRig.root.visible = true;
+        this.playerRig.root.position.copy(this.playerPos);
+        this.audio.updateEngine(false, 0, '');
+        store.pushNotification('Flight Landed', `Arrived safely at ${this.flightSequence.destName}!`, 'success');
+        store.updateTelemetry({ inFlight: false, altitudeMeters: 0 });
+        this.flightSequence = null;
+      } else {
+        store.updateTelemetry({ altitudeMeters: Math.round(alt), speedKmh: 280 });
+      }
+      return;
+    }
+
     if (store.phase === 'menu') {
       this.npcManager.update(dt, this.playerPos, this.world.colliders, store.npcDensity, null);
       this.vehicleSim.update(
@@ -713,7 +1021,6 @@ export class InfinityCityEngine {
       return;
     }
 
-    // Gameplay Inputs
     const fwdInput =
       (this.keys['KeyW'] || this.keys['ArrowUp'] ? 1 : 0) -
       (this.keys['KeyS'] || this.keys['ArrowDown'] ? 1 : 0) +
@@ -728,7 +1035,6 @@ export class InfinityCityEngine {
     let playerSpeedNorm = 0;
 
     if (this.isRidingTrain) {
-      // Riding seated inside Kerala Express Coach 1
       const ts = this.world.trainState;
       this.playerPos.set(ts.seatWorldPos.x, ts.seatWorldPos.y - 0.35, ts.seatWorldPos.z);
       this.playerYaw = 0;
@@ -738,7 +1044,6 @@ export class InfinityCityEngine {
       updateHumanAnimation(this.playerRig, this.playerAnim, dt, 0, true, false, null, 'full');
       this.audio.updateEngine(false, 0, '');
     } else if (!this.activeVehicle) {
-      // On-foot player character movement relative to cameraYaw
       const moveZ = THREE.MathUtils.clamp(fwdInput, -1, 1);
       const moveX = THREE.MathUtils.clamp(-steerInput, -1, 1);
       const mag = Math.hypot(moveX, moveZ);
@@ -746,12 +1051,13 @@ export class InfinityCityEngine {
       if (mag > 0.08) {
         const moveSpeed = sprint ? 6.8 : 3.4;
         const inputAngle = Math.atan2(moveX, moveZ);
-        // Camera looks from behind at (sin(cameraYaw), cos(cameraYaw)) -> forward is ( -sin(cameraYaw), -cos(cameraYaw) )
         const worldDirAngle = this.cameraYaw + Math.PI + inputAngle;
         const dx = Math.sin(worldDirAngle) * moveSpeed * dt;
         const dz = Math.cos(worldDirAngle) * moveSpeed * dt;
 
         const resolved = this.resolvePlayerBuildingCollision(
+          this.playerPos.x,
+          this.playerPos.z,
           this.playerPos.x + dx,
           this.playerPos.z + dz,
           this.world.colliders
@@ -759,7 +1065,6 @@ export class InfinityCityEngine {
         this.playerPos.x = resolved.x;
         this.playerPos.z = resolved.z;
 
-        // Smooth character turning
         let diff = worldDirAngle - this.playerYaw;
         while (diff > Math.PI) diff -= Math.PI * 2;
         while (diff < -Math.PI) diff += Math.PI * 2;
@@ -768,18 +1073,21 @@ export class InfinityCityEngine {
         playerSpeedNorm = sprint ? 1.85 : 1.0;
       }
 
-      // Jump physics
       if (this.keys['Space'] && this.isGrounded) {
         this.playerVelY = 6.2;
         this.isGrounded = false;
       }
       if (!this.isGrounded) {
-        this.playerVelY -= 17.5 * dt;
+        this.playerVelY -= (this.parachuteActive ? 6.5 : 17.5) * dt;
+        if (this.parachuteActive) {
+          this.playerVelY = Math.max(-5.5, this.playerVelY);
+        }
         this.playerPos.y += this.playerVelY * dt;
         if (this.playerPos.y <= 0) {
           this.playerPos.y = 0;
           this.playerVelY = 0;
           this.isGrounded = true;
+          this.parachuteActive = false;
         }
       }
 
@@ -799,10 +1107,8 @@ export class InfinityCityEngine {
       );
       this.audio.updateEngine(false, 0, '');
     } else {
-      // Driving vehicle
       this.audio.updateEngine(true, this.activeVehicle.speed * 3.6, this.activeVehicle.spec.category);
 
-      // Position seated player inside vehicle
       _seatWorld.copy(this.activeVehicle.model.seatPosition);
       _seatWorld.applyAxisAngle(THREE.Object3D.DEFAULT_UP, this.activeVehicle.yaw);
       this.playerPos.set(
@@ -813,20 +1119,31 @@ export class InfinityCityEngine {
       this.playerYaw = this.activeVehicle.yaw;
 
       const isCockpit = store.cameraMode === 'first-person';
-      this.playerRig.root.visible = !isCockpit && this.activeVehicle.spec.category !== 'bus';
+      this.playerRig.root.visible =
+        !isCockpit &&
+        this.activeVehicle.spec.category !== 'bus' &&
+        !(this.activeVehicle.spec.category === 'airplane' && this.activeVehicle.spec.seats > 6);
       this.playerRig.root.position.copy(this.playerPos);
       this.playerRig.root.rotation.y = this.playerYaw;
       updateHumanAnimation(this.playerRig, this.playerAnim, dt, 0, true, false, null, 'full');
     }
 
-    // Update Vehicles, Police Patrol/Pursuit & AI Traffic
+    const aircraftClimbInput = this.activeVehicle?.spec.isAircraft
+      ? (this.keys['Space'] ? 1 : 0) -
+        (this.keys['ShiftLeft'] || this.keys['ShiftRight'] || this.keys['KeyX'] ? 1 : 0) +
+        this.mobileInput.climb
+      : 0;
+
     const vehicleInput: DrivingInput = this.activeVehicle
       ? {
           throttle: THREE.MathUtils.clamp(fwdInput, -1, 1),
           steer: THREE.MathUtils.clamp(steerInput, -1, 1),
-          handbrake,
+          handbrake: this.activeVehicle.spec.isAircraft ? false : handbrake,
+          climb: THREE.MathUtils.clamp(aircraftClimbInput, -1, 1),
+          leftIndicator: this.leftIndicator,
+          rightIndicator: this.rightIndicator,
         }
-      : { throttle: 0, steer: 0, handbrake: false };
+      : { throttle: 0, steer: 0, handbrake: false, climb: 0 };
 
     this.vehicleSim.update(
       dt,
@@ -848,10 +1165,13 @@ export class InfinityCityEngine {
         this.audio.playImpact(Math.min(1.6, impactSpeed * 0.12));
         this.cameraShake = Math.max(this.cameraShake, Math.min(0.65, impactSpeed * 0.045));
         store.escalateWanted(`Pedestrian Collision (${hitNpc.def.appearance.name})`, 1);
+      },
+      () => {
+        this.audio.playChime('alert');
+        store.triggerPoliceArrest();
       }
     );
 
-    // Update Kerala NPCs
     this.npcManager.update(
       dt,
       this.playerPos,
@@ -890,10 +1210,15 @@ export class InfinityCityEngine {
       this.missionBeacon.visible = false;
     }
 
-    // Smooth Camera Update (Third-Person / First-Person / Cinematic)
+    // Refresh GPS dynamic distance & ETA at ~2 Hz
+    this.gpsRefreshTimer += dt;
+    if (this.gpsRefreshTimer >= 0.5 && store.gpsRoute) {
+      this.gpsRefreshTimer = 0;
+      store.refreshGpsProgress(this.playerPos.x, this.playerPos.z);
+    }
+
     this.updateCamera(dt, store.cameraMode);
 
-    // Sync HUD telemetry at ~10 Hz
     this.telemetryTimer += dt;
     if (this.telemetryTimer >= 0.1) {
       this.telemetryTimer = 0;
@@ -938,7 +1263,6 @@ export class InfinityCityEngine {
 
     if (this.activeVehicle) {
       if (!this.isDraggingLook) {
-        // Gently align behind vehicle heading when driving
         const desiredYaw = this.activeVehicle.yaw + Math.PI;
         let diff = desiredYaw - this.cameraYaw;
         while (diff > Math.PI) diff -= Math.PI * 2;
@@ -953,9 +1277,10 @@ export class InfinityCityEngine {
         _camDesired.y += this.activeVehicle.y;
         _camDesired.z += this.activeVehicle.z;
 
+        const pitchLook = this.activeVehicle.spec.isAircraft ? -this.activeVehicle.pitchAngle * 18 : -0.3;
         _camTarget.set(
           _camDesired.x + Math.sin(this.activeVehicle.yaw) * 18,
-          _camDesired.y - 0.3,
+          _camDesired.y + pitchLook,
           _camDesired.z + Math.cos(this.activeVehicle.yaw) * 18
         );
         this.camera.position.copy(_camDesired);
@@ -964,14 +1289,23 @@ export class InfinityCityEngine {
         return;
       }
 
-      const dist = mode === 'cinematic' ? 11.5 : this.activeVehicle.spec.category === 'bus' ? 12 : 7.4;
-      const height = mode === 'cinematic' ? 4.4 : 2.9;
+      const isPlane = !!this.activeVehicle.spec.isAircraft;
+      const dist = isPlane
+        ? mode === 'cinematic'
+          ? 22
+          : 15
+        : mode === 'cinematic'
+        ? 11.5
+        : this.activeVehicle.spec.category === 'bus'
+        ? 12
+        : 7.4;
+      const height = isPlane ? (mode === 'cinematic' ? 6.5 : 4.4) : mode === 'cinematic' ? 4.4 : 2.9;
       _camDesired.set(
         this.activeVehicle.x + Math.sin(this.cameraYaw) * Math.cos(this.cameraPitch) * dist,
         Math.max(1.2, this.activeVehicle.y + height + Math.sin(this.cameraPitch) * dist * 0.5),
         this.activeVehicle.z + Math.cos(this.cameraYaw) * Math.cos(this.cameraPitch) * dist
       );
-      _camTarget.set(this.activeVehicle.x, this.activeVehicle.y + 1.35, this.activeVehicle.z);
+      _camTarget.set(this.activeVehicle.x, this.activeVehicle.y + (isPlane ? 1.8 : 1.35), this.activeVehicle.z);
 
       this.camera.position.x = THREE.MathUtils.damp(this.camera.position.x, _camDesired.x, 9, dt);
       this.camera.position.y = THREE.MathUtils.damp(this.camera.position.y, _camDesired.y, 9, dt);
@@ -979,7 +1313,6 @@ export class InfinityCityEngine {
       this.applyShakeOffset();
       this.camera.lookAt(_camTarget);
 
-      // Subtle FOV widening at high speed
       const speedKmh = Math.abs(this.activeVehicle.speed) * 3.6;
       const targetFov = THREE.MathUtils.clamp(64 + speedKmh * 0.12, 64, 82);
       if (Math.abs(this.camera.fov - targetFov) > 0.2) {
@@ -989,7 +1322,6 @@ export class InfinityCityEngine {
       return;
     }
 
-    // On-foot camera
     if (mode === 'first-person') {
       _camDesired.set(this.playerPos.x, this.playerPos.y + 1.62, this.playerPos.z);
       _camTarget.set(
@@ -1025,7 +1357,15 @@ export class InfinityCityEngine {
   private syncHudTelemetry(): void {
     const store = useGameStore.getState();
 
-    // Determine contextual interaction prompt
+    // Auto-discover nearby Kerala landmarks (+1 Game Point)
+    for (const loc of WORLD_LOCATIONS) {
+      const d = Math.hypot(this.playerPos.x - loc.x, this.playerPos.z - loc.z);
+      if (d <= loc.radius + 5) {
+        store.markLocationDiscovered(loc.id, loc.name);
+        break;
+      }
+    }
+
     let prompt: string | null = null;
     const ts = this.world.trainState;
     if (this.isRidingTrain) {
@@ -1033,7 +1373,19 @@ export class InfinityCityEngine {
         ? `Press E · Exit Train at ${ts.stationName}`
         : 'Press E · Exit Kerala Express (H Horn)';
     } else if (this.activeVehicle) {
-      prompt = `Press E · Exit ${this.activeVehicle.spec.modelName}`;
+      if (this.activeVehicle.spec.isAircraft) {
+        prompt =
+          this.activeVehicle.y > 3.5
+            ? `Flying ${this.activeVehicle.spec.modelName} · SPACE Climb · SHIFT Descend · E Parachute Exit`
+            : `Press E · Exit ${this.activeVehicle.spec.modelName} (W Thrust · SPACE Takeoff)`;
+      } else {
+        const nearFuel = WORLD_LOCATIONS.find(
+          (loc) => loc.type === 'fuel' && Math.hypot(this.playerPos.x - loc.x, this.playerPos.z - loc.z) <= loc.radius + 4
+        );
+        prompt = nearFuel
+          ? `Press F · Refuel ${this.activeVehicle.spec.modelName} (₹450) · E Exit`
+          : `Press E · Exit ${this.activeVehicle.spec.modelName}`;
+      }
     } else if (
       Math.abs(this.playerPos.x - ts.x) < 6.4 &&
       Math.abs(this.playerPos.z - (ts.z - 6)) < 11.5
@@ -1042,7 +1394,9 @@ export class InfinityCityEngine {
     } else {
       const veh = this.vehicleSim.findClosestEnterableVehicle(this.playerPos, 4.8);
       if (veh) {
-        prompt = `Press E · Enter ${veh.spec.modelName}`;
+        prompt = veh.spec.isAircraft
+          ? `Press E · Enter & Fly ${veh.spec.modelName}`
+          : `Press E · Enter ${veh.spec.modelName}`;
       } else {
         const npc = this.npcManager.findClosestInteractableNpc(this.playerPos, 4.2);
         if (npc) {
@@ -1059,10 +1413,29 @@ export class InfinityCityEngine {
       }
     }
 
-    // Build minimap entities list
+    // Build Minimap Entities including Personal Houses, Garage, Cars & Bikes!
     const entities: MinimapEntity[] = [];
     for (const loc of WORLD_LOCATIONS) {
-      entities.push({ x: loc.x, z: loc.z, type: 'location', label: loc.name });
+      entities.push({
+        x: loc.x,
+        z: loc.z,
+        type: loc.type === 'garage' ? 'my_garage' : 'location',
+        label: loc.name,
+      });
+    }
+    for (const propId of store.ownedPropertyIds) {
+      const prop = PROPERTY_CATALOG.find((p) => p.id === propId);
+      if (prop) {
+        entities.push({ x: prop.spawnX, z: prop.spawnZ, type: 'my_house', label: prop.name });
+      }
+    }
+    for (const ov of store.ownedVehicles) {
+      entities.push({
+        x: ov.parkedX,
+        z: ov.parkedZ,
+        type: ov.category === 'motorcycle' ? 'my_bike' : 'my_car',
+        label: ov.modelName,
+      });
     }
     for (const v of this.vehicleSim.vehicles) {
       if (v.isPlayerDriven) continue;
@@ -1105,29 +1478,63 @@ export class InfinityCityEngine {
       ? '3'
       : '4';
 
-    // Friendly local neighborhood / Kerala region name
+    // Determine exact Kerala District & Locality
     let areaName = 'Fort Kochi · Ernakulam';
+    let districtId = 'ernakulam';
+    const px = this.playerPos.x;
+    const pz = this.playerPos.z;
+
     if (this.isRidingTrain) {
       areaName = ts.isStoppedAtStation ? `Kerala Express · ${ts.stationName}` : 'Kerala Express · Rail Corridor';
-    } else if (this.playerPos.x > 195 && this.playerPos.z < -280) {
+    } else if (pz < -300 && px < -60) {
+      areaName = 'Bekal Fort · Kasaragod';
+      districtId = 'kasaragod';
+    } else if (pz < -240 && px < -60) {
+      areaName = 'Kannur Airport Coast';
+      districtId = 'kannur';
+    } else if (pz < -175 && px < -60) {
+      areaName = 'SM Street · Kozhikode';
+      districtId = 'kozhikode';
+    } else if (px > 180 && pz < -275) {
       areaName = 'Wayanad Hairpin Ghats';
-    } else if (this.playerPos.x > 240 && this.playerPos.z < -170) {
+      districtId = 'wayanad';
+    } else if (px > 240 && pz < -170) {
       areaName = 'Munnar Tea Estates · Idukki';
-    } else if (this.playerPos.z < -180 && this.playerPos.x < 120) {
-      areaName = 'Thrissur Swaraj Heritage';
-    } else if (this.playerPos.x < -175 && this.playerPos.z > 180) {
-      areaName = 'Alappuzha Kuttanad Islands';
-    } else if (this.playerPos.x < -80 && this.playerPos.z > 300) {
-      areaName = 'Kovalam Lighthouse Coast';
-    } else if (this.playerPos.z > 235) {
-      areaName = 'Thiruvananthapuram Secretariat';
-    } else if (this.playerPos.x > 65) {
-      areaName = 'Ernakulam Junction · Station Rd';
-    } else if (this.playerPos.x < -145) {
+      districtId = 'idukki';
+    } else if (px > 35 && pz < -175) {
+      areaName = 'Malappuram Campus Hills';
+      districtId = 'malappuram';
+    } else if (px > 160 && pz < -120) {
+      areaName = 'Malampuzha Dam · Palakkad';
+      districtId = 'palakkad';
+    } else if (pz < -175 && px < 35) {
+      areaName = 'Swaraj Round · Thrissur';
+      districtId = 'thrissur';
+    } else if (px < -175 && pz > 180) {
+      areaName = 'Kuttanad Islands · Alappuzha';
+      districtId = 'alappuzha';
+    } else if (px > 95 && pz > 80 && pz < 175) {
+      areaName = 'Kumarakom · Kottayam';
+      districtId = 'kottayam';
+    } else if (px > 110 && pz >= 175 && pz < 250) {
+      areaName = 'Pamba Eco Park · Pathanamthitta';
+      districtId = 'pathanamthitta';
+    } else if (px < -80 && pz > 250 && pz < 338) {
+      areaName = 'Ashtamudi Harbour · Kollam';
+      districtId = 'kollam';
+    } else if (px < -80 && pz >= 338) {
+      areaName = 'Kovalam Lighthouse · TVM';
+      districtId = 'thiruvananthapuram';
+    } else if (pz >= 235) {
+      areaName = 'Secretariat · Thiruvananthapuram';
+      districtId = 'thiruvananthapuram';
+    } else if (px > 65) {
+      areaName = 'Ernakulam Junction · Kochi';
+    } else if (px < -145) {
       areaName = 'Fort Kochi Beach · Arabian Sea';
-    } else if (this.playerPos.z > 95) {
+    } else if (pz > 95) {
       areaName = 'Vembanad Backwater Estates';
-    } else if (this.playerPos.z < -70) {
+    } else if (pz < -70) {
       areaName = 'Collectorate & NH-66 North';
     }
 
@@ -1138,9 +1545,16 @@ export class InfinityCityEngine {
         z: this.playerPos.z,
         yaw: this.playerYaw,
       },
+      currentDistrictId: districtId,
       inTrain: this.isRidingTrain,
+      inAircraft: !!this.activeVehicle?.spec.isAircraft,
+      altitudeMeters: this.activeVehicle?.spec.isAircraft ? Math.max(0, Math.round(this.activeVehicle.y)) : 0,
       speedKmh,
       gearLabel,
+      currentVehicleFuel: this.activeVehicle ? Math.round(this.activeVehicle.fuel) : 100,
+      currentVehicleHealth: this.activeVehicle ? Math.round(this.activeVehicle.health) : 100,
+      leftIndicator: this.leftIndicator,
+      rightIndicator: this.rightIndicator,
       interactionPrompt: prompt,
       currentLocationName: areaName,
       minimapEntities: entities,

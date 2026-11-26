@@ -2,10 +2,12 @@ import {
   DensityPreset,
   GraphicsPreset,
   HumanAppearance,
+  InventoryItem,
   OwnedVehicle,
-  TrafficFine,
-  WeatherType,
   TimePeriod,
+  TrafficFine,
+  TransitTicket,
+  WeatherType,
 } from '../types/game';
 
 export interface SaveGamePayload {
@@ -13,12 +15,17 @@ export interface SaveGamePayload {
   savedAt: number;
   cash: number;
   bankBalance: number;
+  points: number;
   health: number;
   playerPos: { x: number; y: number; z: number; yaw: number };
   currentDistrictId: string;
   activeHomeId: string;
   ownedPropertyIds: string[];
+  houseUpgrades: Record<string, string[]>;
   ownedVehicles: OwnedVehicle[];
+  inventory: InventoryItem[];
+  discoveredLocationIds: string[];
+  transitTickets: TransitTicket[];
   completedMissionIds: string[];
   fines: TrafficFine[];
   playerAppearance: HumanAppearance;
