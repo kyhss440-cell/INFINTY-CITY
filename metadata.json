@@ -1,0 +1,6 @@
+{
+  "name": "Infinity City: Kerala Ultimate Edition",
+  "description": "Open-world 3D Kerala life simulation, driving, exploration, and mission game extending from Kasaragod to Thiruvananthapuram with realistic human NPCs, original vehicles, and dynamic monsoon weather.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
